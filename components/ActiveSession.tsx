@@ -32,6 +32,7 @@ const EMOTION_ICONS: Record<string, string> = {
 
 const ActiveSession: React.FC<ActiveSessionProps> = ({ scenario, avatarConfig, sessionSettings, initialTranscript, onEndSession }) => {
   const [status, setStatus] = useState<ConnectionStatus>(ConnectionStatus.CONNECTING);
+  const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [transcripts, setTranscripts] = useState<TranscriptItem[]>(initialTranscript || []);
   const volumeRef = useRef({ input: 0, output: 0 });
   const [startTime] = useState<number>(Date.now());
@@ -197,28 +198,75 @@ const ActiveSession: React.FC<ActiveSessionProps> = ({ scenario, avatarConfig, s
     return () => clearInterval(interval);
   }, [status, isSpeaking, breathPhase, transcripts]);
 
-  useEffect(() => {
-    const init = async () => {
+  const startConnection = useCallback(async () => {
+    setStatus(ConnectionStatus.CONNECTING);
+    setErrorMessage(null);
+
+    const apiKey = 
+      process.env.GEMINI_API_KEY || 
+      process.env.API_KEY || 
+      (import.meta as any).env?.VITE_GEMINI_API_KEY || 
+      (import.meta as any).env?.GEMINI_API_KEY || 
+      '';
+
+    if (!apiKey) {
+      console.error("No Gemini API key found");
+      if (mountedRef.current) {
+        setStatus(ConnectionStatus.ERROR);
+        setErrorMessage("Gemini API key is missing. Please check your configuration.");
+      }
+      return;
+    }
+
+    try {
+      if (clientRef.current) {
+        await clientRef.current.disconnect();
+        clientRef.current = null;
+      }
+
       clientRef.current = new LiveClient(
-        process.env.API_KEY || '',
+        apiKey,
         handleTranscript,
         (inV, outV) => { volumeRef.current = { input: inV, output: outV }; },
         () => {}, 
         (emotion, intent) => { if (mountedRef.current) setPerception({ emotion, intent }); },
         (phase) => { if (mountedRef.current) setBreathPhase(phase); },
+        () => { 
+          if (mountedRef.current) {
+            setStatus(ConnectionStatus.CONNECTED);
+            setErrorMessage(null);
+          }
+        },
         () => { if (mountedRef.current) setStatus(ConnectionStatus.DISCONNECTED); },
-        (err) => { if (mountedRef.current) setStatus(ConnectionStatus.ERROR); }
+        (err) => { 
+          if (mountedRef.current) {
+            setStatus(ConnectionStatus.ERROR);
+            setErrorMessage(err.message || "Connection failed");
+          }
+        }
       );
-      const finalSystemInstruction = scenario.systemInstruction + (sessionSettings.customSystemInstruction ? `\n\nUSER CUSTOMIZATION: ${sessionSettings.customSystemInstruction}` : '');
+
+      const finalSystemInstruction = scenario.systemInstruction + 
+        (sessionSettings.customSystemInstruction ? `\n\nUSER CUSTOMIZATION: ${sessionSettings.customSystemInstruction}` : '');
+      
       await clientRef.current.connect(finalSystemInstruction, sessionSettings.voiceName, sessionSettings.audioQuality || 'standard');
-      if (mountedRef.current) setStatus(ConnectionStatus.CONNECTED);
-    };
-    init();
+    } catch (err: any) {
+      console.error("Connection attempt failed:", err);
+      if (mountedRef.current) {
+        setStatus(ConnectionStatus.ERROR);
+        setErrorMessage(err?.message || "Failed to establish connection");
+      }
+    }
+  }, [scenario.systemInstruction, sessionSettings.customSystemInstruction, sessionSettings.voiceName, sessionSettings.audioQuality, handleTranscript]);
+
+  useEffect(() => {
+    mountedRef.current = true;
+    startConnection();
     return () => { 
       mountedRef.current = false; 
       clientRef.current?.disconnect(); 
     };
-  }, [scenario.systemInstruction, sessionSettings.voiceName, sessionSettings.audioQuality, handleTranscript]);
+  }, [startConnection]);
 
   const handleFinish = () => {
     const durationSeconds = (Date.now() - startTime) / 1000;
@@ -261,6 +309,46 @@ const ActiveSession: React.FC<ActiveSessionProps> = ({ scenario, avatarConfig, s
         </div>
 
         <div className="flex-1 relative flex flex-col min-h-0 bg-slate-50/30 overflow-hidden">
+            {status === ConnectionStatus.CONNECTING && (
+              <div className="absolute inset-0 bg-white/90 backdrop-blur-sm z-50 flex flex-col items-center justify-center p-6 text-center animate-fade-in">
+                <div className="w-16 h-16 rounded-2xl bg-brand-50 border border-brand-200 flex items-center justify-center mb-4 text-brand-600 shadow-sm">
+                  <i className="fa-solid fa-spinner fa-spin text-2xl"></i>
+                </div>
+                <h3 className="text-lg font-bold text-slate-900 mb-1">Connecting to AI Coach</h3>
+                <p className="text-xs text-slate-500 max-w-xs leading-relaxed">
+                  Establishing live voice stream with Gemini. Please grant microphone access if prompted by your browser.
+                </p>
+              </div>
+            )}
+
+            {(status === ConnectionStatus.ERROR || status === ConnectionStatus.DISCONNECTED) && (
+              <div className="absolute inset-0 bg-white/95 backdrop-blur-sm z-50 flex flex-col items-center justify-center p-6 text-center animate-fade-in">
+                <div className="w-16 h-16 rounded-2xl bg-red-50 border border-red-200 flex items-center justify-center mb-4 text-red-500 shadow-sm">
+                  <i className="fa-solid fa-plug-circle-xmark text-2xl"></i>
+                </div>
+                <h3 className="text-lg font-bold text-slate-900 mb-1">
+                  {status === ConnectionStatus.ERROR ? 'Connection Failed' : 'Session Disconnected'}
+                </h3>
+                <p className="text-xs text-slate-600 max-w-sm leading-relaxed mb-5 bg-red-50/60 p-3 rounded-xl border border-red-100 font-medium">
+                  {errorMessage || (status === ConnectionStatus.DISCONNECTED ? 'The session ended unexpectedly.' : 'Unable to connect to the AI Coach service.')}
+                </p>
+                <div className="flex items-center gap-3">
+                  <button 
+                    onClick={startConnection}
+                    className="bg-brand-600 hover:bg-brand-700 text-white font-bold text-xs px-5 py-2.5 rounded-xl transition-all shadow-md flex items-center gap-2"
+                  >
+                    <i className="fa-solid fa-rotate-right"></i>
+                    Retry Connection
+                  </button>
+                  <button 
+                    onClick={handleFinish}
+                    className="bg-slate-100 hover:bg-slate-200 text-slate-700 font-bold text-xs px-4 py-2.5 rounded-xl transition-all"
+                  >
+                    Exit Session
+                  </button>
+                </div>
+              </div>
+            )}
 
             <div className="absolute top-16 left-0 right-0 z-30 flex flex-col items-center gap-2 pointer-events-none">
                 {showFillerAlert && <div className="bg-orange-500 text-white text-[10px] font-black px-3 py-1 rounded-full shadow-lg animate-bounce uppercase tracking-widest">Filler Detected</div>}

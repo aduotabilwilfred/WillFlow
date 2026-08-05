@@ -9,6 +9,7 @@ export type VolumeCallback = (inputVolume: number, outputVolume: number) => void
 export type GroundingCallback = (metadata: any) => void;
 export type AnalysisCallback = (emotion: string, intent: string) => void;
 export type BreathCallback = (phase: 'IN' | 'HOLD' | 'OUT' | 'END') => void;
+export type OpenCallback = () => void;
 
 const EMOTION_REGEX = /\[{1,2}(?:E|Emotion):\s*([^\]]+)\]{1,2}/gi;
 const INTENT_REGEX = /\[{1,2}(?:I|Intent):\s*([^\]]+)\]{1,2}/gi;
@@ -41,6 +42,7 @@ export class LiveClient {
   private recordedChunks: Float32Array[] = [];
   private isRecording: boolean = false;
   private quality: AudioQuality = 'standard';
+  private isDisconnected: boolean = false;
 
   // Analysis State
   private currentModelTurnText: string = '';
@@ -51,6 +53,7 @@ export class LiveClient {
   private onGrounding: GroundingCallback;
   private onAnalysis: AnalysisCallback;
   private onBreath: BreathCallback;
+  private onOpen: OpenCallback;
   private onClose: () => void;
   private onError: (err: Error) => void;
 
@@ -63,6 +66,7 @@ export class LiveClient {
     onGrounding: GroundingCallback,
     onAnalysis: AnalysisCallback,
     onBreath: BreathCallback,
+    onOpen: OpenCallback,
     onClose: () => void,
     onError: (err: Error) => void
   ) {
@@ -72,12 +76,14 @@ export class LiveClient {
     this.onGrounding = onGrounding;
     this.onAnalysis = onAnalysis;
     this.onBreath = onBreath;
+    this.onOpen = onOpen;
     this.onClose = onClose;
     this.onError = onError;
   }
 
   public async connect(systemInstruction: string, voiceName: string, quality: AudioQuality = 'standard') {
     this.quality = quality;
+    this.isDisconnected = false;
     try {
       this.inputAudioContext = new (window.AudioContext || (window as any).webkitAudioContext)({
         sampleRate: AUDIO_SAMPLE_RATE_INPUT,
@@ -87,6 +93,14 @@ export class LiveClient {
       });
       
       this.mediaStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+
+      if (this.isDisconnected || !this.inputAudioContext || !this.outputAudioContext) {
+        if (this.mediaStream) {
+          this.mediaStream.getTracks().forEach(track => track.stop());
+          this.mediaStream = null;
+        }
+        return;
+      }
 
       this.inputAnalyser = this.inputAudioContext.createAnalyser();
       this.inputAnalyser.fftSize = this.quality === 'studio' ? 512 : 256;
@@ -113,22 +127,45 @@ export class LiveClient {
         },
         callbacks: {
           onopen: () => {
+            if (this.isDisconnected) return;
+            this.onOpen();
             this.startAudioInput(promise);
             this.startAnalysisLoop();
           },
-          onmessage: (msg: LiveServerMessage) => this.handleMessage(msg),
+          onmessage: (msg: LiveServerMessage) => {
+            if (this.isDisconnected) return;
+            this.handleMessage(msg);
+          },
           onclose: () => {
+            if (this.isDisconnected) return;
             this.onClose();
           },
-          onerror: (err: ErrorEvent) => {
-            this.onError(new Error("Connection error: " + err.message));
+          onerror: (err: any) => {
+            if (this.isDisconnected) return;
+            console.error("Gemini Live API error:", err);
+            const msg = err?.message || err?.reason || (typeof err === 'string' ? err : "Connection error");
+            if (/goaway|session duration limit/i.test(msg)) {
+              console.log("Session limit reached or GoAway received.");
+              this.disconnect();
+              this.onError(new Error("Live session duration limit reached. Click 'Retry Connection' to continue."));
+              return;
+            }
+            this.onError(new Error("Connection error: " + msg));
           }
         }
       });
 
       this.sessionPromise = promise;
-    } catch (error) {
-      this.onError(error as Error);
+    } catch (error: any) {
+      if (this.isDisconnected) return;
+      console.error("Error connecting LiveClient:", error);
+      let errMsg = error?.message || "Failed to initialize microphone or connection";
+      if (error?.name === 'NotAllowedError' || error?.name === 'PermissionDeniedError') {
+        errMsg = "Microphone access was denied. Please allow microphone permissions in your browser and try again.";
+      } else if (error?.name === 'NotFoundError' || error?.name === 'DevicesNotFoundError') {
+        errMsg = "No microphone found. Please connect a microphone and try again.";
+      }
+      this.onError(new Error(errMsg));
     }
   }
 
@@ -283,7 +320,7 @@ export class LiveClient {
       const inputData = e.inputBuffer.getChannelData(0);
       const pcmBlob = createBlob(inputData);
       sessionPromise.then((session) => {
-        session.sendRealtimeInput({ media: pcmBlob });
+        session.sendRealtimeInput({ audio: pcmBlob });
       });
     };
 
@@ -293,6 +330,13 @@ export class LiveClient {
   }
 
   private async handleMessage(message: LiveServerMessage) {
+    if ((message as any).goAway || (message.serverContent as any)?.goAway) {
+      console.log("GoAway signal received from Gemini Live API. Closing connection gracefully.");
+      this.disconnect();
+      this.onError(new Error("Live session duration limit reached. Click 'Retry Connection' to continue."));
+      return;
+    }
+
     const audioData = message.serverContent?.modelTurn?.parts?.[0]?.inlineData?.data;
     if (audioData && this.outputAudioContext) {
       this.playAudio(audioData);
@@ -376,6 +420,7 @@ export class LiveClient {
   }
 
   public async disconnect() {
+    this.isDisconnected = true;
     this.isRecording = false;
     
     if (this.animationFrameId) {
@@ -396,52 +441,68 @@ export class LiveClient {
     this.stopPlayback();
     
     if (this.processor) {
-      this.processor.disconnect();
+      try { this.processor.disconnect(); } catch (e) {}
       this.processor = null;
     }
     if (this.recordingProcessor) {
-      this.recordingProcessor.disconnect();
+      try { this.recordingProcessor.disconnect(); } catch (e) {}
       this.recordingProcessor = null;
     }
     if (this.recordingHighPass) {
-      this.recordingHighPass.disconnect();
+      try { this.recordingHighPass.disconnect(); } catch (e) {}
       this.recordingHighPass = null;
     }
     if (this.recordingPresence) {
-      this.recordingPresence.disconnect();
+      try { this.recordingPresence.disconnect(); } catch (e) {}
       this.recordingPresence = null;
     }
     if (this.recordingDeEsser) {
-      this.recordingDeEsser.disconnect();
+      try { this.recordingDeEsser.disconnect(); } catch (e) {}
       this.recordingDeEsser = null;
     }
     if (this.recordingAir) {
-      this.recordingAir.disconnect();
+      try { this.recordingAir.disconnect(); } catch (e) {}
       this.recordingAir = null;
     }
     if (this.recordingCompressor) {
-      this.recordingCompressor.disconnect();
+      try { this.recordingCompressor.disconnect(); } catch (e) {}
       this.recordingCompressor = null;
     }
     if (this.recordingLimiter) {
-      this.recordingLimiter.disconnect();
+      try { this.recordingLimiter.disconnect(); } catch (e) {}
       this.recordingLimiter = null;
     }
     if (this.source) {
-      this.source.disconnect();
+      try { this.source.disconnect(); } catch (e) {}
       this.source = null;
     }
     if (this.mediaStream) {
-      this.mediaStream.getTracks().forEach(track => track.stop());
+      try {
+        this.mediaStream.getTracks().forEach(track => track.stop());
+      } catch (e) {}
       this.mediaStream = null;
     }
     if (this.inputAudioContext) {
-      await this.inputAudioContext.close();
+      const ctx = this.inputAudioContext;
       this.inputAudioContext = null;
+      try {
+        if (ctx.state !== 'closed') {
+          await ctx.close();
+        }
+      } catch (e) {
+        console.debug('Error closing inputAudioContext', e);
+      }
     }
     if (this.outputAudioContext) {
-      await this.outputAudioContext.close();
+      const ctx = this.outputAudioContext;
       this.outputAudioContext = null;
+      try {
+        if (ctx.state !== 'closed') {
+          await ctx.close();
+        }
+      } catch (e) {
+        console.debug('Error closing outputAudioContext', e);
+      }
     }
     
     this.onVolume(0, 0);
